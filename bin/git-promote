@@ -1,0 +1,78 @@
+#!/bin/sh
+
+set -e
+
+SRC_BRANCH=`git branch --show-current`
+DST_BRANCH=prod
+TMP_BRANCH=tmp/git-promote-$(hexdump -vn4 -e '"%08x\n"' /dev/urandom)
+VERBOSE=0
+PRETEND=0
+
+# Function definitions
+debug() { if [ "${VERBOSE}" -ge "${1}" ]; then shift; echo "$@"; fi; }
+log() { debug 1 "$@"; }
+reverse() { local rev=; for i in $@; do rev="$i $rev"; done; echo $rev; }
+
+while [ $# -gt 0 ]; do
+	unset OPTIND OPTARG
+	while getopts "d:ps:v" arg; do
+		case $arg in
+			d) DST_BRANCH=$arg;;
+            p) PRETEND=1;;
+			s) SRC_BRANCH=$arg;;
+			v) VERBOSE=$(($VERBOSE + 1));;
+		esac
+	done
+	shift $((OPTIND-1))
+	if [ $# -gt 0 ]; then
+		DST_COMMITS="${DST_COMMITS} $(git rev-parse --short $1)"
+		shift
+	fi
+done
+
+[ "${VERBOSE}" -lt "9" ] && REDIRECT=/dev/null || REDIRECT=/dev/stdout
+
+debug 9 "      Verbosity: ${VERBOSE}"
+debug 9 " Command Output: ${REDIRECT}"
+debug 3 "  Source Branch: ${SRC_BRANCH}"
+debug 3 "    Dest Branch: ${DST_BRANCH}"
+debug 4 "    Temp Branch: ${TMP_BRANCH}"
+
+ALL_COMMITS=`git log --no-merges --pretty=format:"%h" ${SRC_BRANCH} ^${DST_BRANCH} | xargs echo`
+DEM_COMMITS=$(echo $ALL_COMMITS | sed $(echo $DST_COMMITS | sed -e 's@\s@// -e s/@' -e 's@^@-e s/@' -e 's@$@//@'))
+NUM_REVERTS=$(echo $ALL_COMMITS | wc -w)
+NUM_COMMITS=$(echo $DST_COMMITS | wc -w)
+NUM_DEMOTES=$(echo $DEM_COMMITS | wc -w)
+
+debug 3 "    New Commits:" ${ALL_COMMITS}
+debug 3 "Promote Commits:${DST_COMMITS}"
+debug 3 " Demote commits: ${DEM_COMMITS}"
+
+if [ -z "${ALL_COMMITS// }" -o -z "${DST_COMMITS// }" ]; then
+	debug 2 "No commits to promote."
+	exit 0
+fi
+
+if [[ -n $(git diff --stat) ]]; then
+	log "Please commit or stash changes before continuing"
+	exit 1
+fi
+
+# Information collected; Create a working branch and proceed.
+
+debug 2 "Reverting ${NUM_REVERTS} commits and reapplying with promoted commits first."
+
+if [ "${PRETEND}" -ge 1 ]; then
+    debug 2 "...Just kidding (exiting)"
+    exit 0
+fi
+
+git checkout -b ${TMP_BRANCH} >${REDIRECT}
+git revert ${ALL_COMMITS} --no-edit >${REDIRECT}
+git reset --soft HEAD~${NUM_REVERTS} >${REDIRECT}
+git commit -m "Housekeeping: revert ${NUM_REVERTS}, promote ${NUM_COMMITS}, demote ${NUM_DEMOTES}" -m "Revert: ${ALL_COMMITS}" -m "Promote: ${DST_COMMITS}" -m "Re-Apply: ${DEM_COMMITS}" >${REDIRECT}
+git cherry-pick ${DST_COMMITS} >${REDIRECT}
+git cherry-pick $(reverse ${DEM_COMMITS}) >${REDIRECT}
+git checkout ${SRC_BRANCH} >${REDIRECT}
+
+debug 2 "Finished."
